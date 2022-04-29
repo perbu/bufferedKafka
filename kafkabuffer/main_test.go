@@ -2,50 +2,39 @@ package kafkabuffer
 
 import (
 	"context"
+	"github.com/segmentio/kafka-go"
+	"os"
+	"sync"
 	"testing"
 	"time"
 )
 
+func TestMain(m *testing.M) {
+	// Init code goes here.
+	ret := m.Run()
+	// Cleanup code goes here.
+	os.Exit(ret)
+}
+
 func TestBuffer_Run(t *testing.T) {
-	type fields struct {
-		broker               string
-		messages             chan Message
-		buffer               []kafka.Message
-		lastSend             time.Time
-		failureState         bool
-		failureRetryInterval time.Duration
-		lastHealthCheck      time.Time
-		batchSize            int
-		interval             time.Duration
-		writer               kwriter
-		maxBatchSize         int
-	}
-	type args struct {
-		ctx context.Context
-	}
-	tests := []struct {
-		name   string
-		fields fields
-		args   args
-	}{
-		// TODO: Add test cases.
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			k := &Buffer{
-				broker:               tt.fields.broker,
-				messages:             tt.fields.messages,
-				buffer:               tt.fields.buffer,
-				lastSend:             tt.fields.lastSend,
-				failureState:         tt.fields.failureState,
-				failureRetryInterval: tt.fields.failureRetryInterval,
-				lastHealthCheck:      tt.fields.lastHealthCheck,
-				batchSize:            tt.fields.batchSize,
-				interval:             tt.fields.interval,
-				writer:               tt.fields.writer,
-				maxBatchSize:         tt.fields.maxBatchSize,
-			}
-			k.Run(tt.args.ctx)
-		})
+	ctx, cancel := context.WithCancel(context.Background())
+	buffer := makeTestBuffer()
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buffer.Run(ctx)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	wg.Wait()
+}
+
+func makeTestBuffer(interval time.Duration) Buffer {
+
+	return Buffer{
+		interval: interval,
+		buffer:   make([]kafka.Message, 10),
+		topic:    "unittest",
 	}
 }

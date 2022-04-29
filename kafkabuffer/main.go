@@ -1,4 +1,4 @@
-package kaffa
+package kafkabuffer
 
 import (
 	"context"
@@ -15,9 +15,9 @@ const (
 	maxBatchSize = 8000
 )
 
-type Kafka struct {
+type Buffer struct {
 	broker               string
-	messages             chan KafkaMessage
+	messages             chan Message
 	buffer               []kafka.Message
 	lastSend             time.Time
 	failureState         bool
@@ -27,28 +27,30 @@ type Kafka struct {
 	interval             time.Duration
 	writer               kwriter
 	maxBatchSize         int
+	topic                string
 }
 
-type KafkaMessage struct {
+type Message struct {
 	Topic   string
 	Content []byte
 }
 
-func Initialize(broker string, flush int, interval time.Duration) *Kafka {
-	return &Kafka{
+func Initialize(broker string, flush int, interval time.Duration) *Buffer {
+	return &Buffer{
 		broker:               broker,
 		batchSize:            flush,
 		interval:             interval,
 		failureState:         false,
 		failureRetryInterval: interval * 10,
-		messages:             make(chan KafkaMessage, 10),
+		messages:             make(chan Message, 10),
 		buffer:               make([]kafka.Message, 0, 10000),
 		writer:               &kafka.Writer{},
 		maxBatchSize:         maxBatchSize,
 	}
 }
 
-func (k *Kafka) Run(ctx context.Context) {
+// Run starts monitoring the channel and sends messages to the broker.
+func (k *Buffer) Run(ctx context.Context) {
 	ticker := time.NewTicker(k.interval)
 	for {
 		select {
@@ -63,7 +65,8 @@ func (k *Kafka) Run(ctx context.Context) {
 }
 
 // Process adds a message to the buffer
-func (k *Kafka) Process(msg KafkaMessage) {
+// It'll transform it from the Message type (used by MQTT) to what Kafka expects.
+func (k *Buffer) Process(msg Message) {
 	msgJson, err := json.Marshal(msg)
 	if err != nil {
 		// todo: Log the error. There is nothing else we can do here.
@@ -80,7 +83,7 @@ func (k *Kafka) Process(msg KafkaMessage) {
 }
 
 // Send will send all messages in the buffer to the kafka broker
-func (k *Kafka) Send() {
+func (k *Buffer) Send() {
 	// send might have been called prematurely. Detect it and return if that is the case.
 	if time.Since(k.lastSend) < k.interval || len(k.buffer) < k.batchSize {
 		return
@@ -107,12 +110,12 @@ func (k *Kafka) Send() {
 }
 
 // sendAll sends all messages in the buffer.
-func (k *Kafka) sendAll() error {
+func (k *Buffer) sendAll() error {
 	return k.writer.WriteMessages(context.Background(), k.buffer...)
 }
 
 // sendBatched sends messages in batches of maxBatchSize.
-func (k *Kafka) sendBatched() error {
+func (k *Buffer) sendBatched() error {
 	l := len(k.buffer)
 	for i := 0; i < l; i += k.maxBatchSize {
 		end := i + k.maxBatchSize
@@ -129,7 +132,7 @@ func (k *Kafka) sendBatched() error {
 
 // sendTestMessage sends a test message with the mqtt topic "test".
 // You wanna ignore these messages in the Kafka consumers.
-func (k *Kafka) sendTestMessage() error {
+func (k *Buffer) sendTestMessage() error {
 	testMsg := kafka.Message{
 		Topic: "test",
 		Value: []byte("Just a test"),
