@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"github.com/segmentio/kafka-go"
+	log "github.com/sirupsen/logrus"
 	"time"
 )
 
@@ -17,7 +18,7 @@ const (
 
 type Buffer struct {
 	broker               string
-	messages             chan Message
+	C                    chan Message
 	buffer               []kafka.Message
 	lastSend             time.Time
 	failureState         bool
@@ -42,7 +43,7 @@ func Initialize(broker string, flush int, interval time.Duration) *Buffer {
 		interval:             interval,
 		failureState:         false,
 		failureRetryInterval: interval * 10,
-		messages:             make(chan Message, 10),
+		C:                    make(chan Message, 10),
 		buffer:               make([]kafka.Message, 0, 10000),
 		writer:               &kafka.Writer{},
 		maxBatchSize:         maxBatchSize,
@@ -52,16 +53,28 @@ func Initialize(broker string, flush int, interval time.Duration) *Buffer {
 // Run starts monitoring the channel and sends messages to the broker.
 func (k *Buffer) Run(ctx context.Context) {
 	ticker := time.NewTicker(k.interval)
+	log.Debugf("Kafka buffer started with interval %v", k.interval)
+loop:
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			log.Info("Kafka buffer: context cancelled")
+			break loop
 		case <-ticker.C:
-			k.Send()
-		case m := <-k.messages:
+			if time.Since(k.lastSend) < k.interval {
+				log.Trace("Tick: Send it!")
+				k.Send()
+			} else {
+				log.Trace("Tick: Not sending anything")
+			}
+		case m := <-k.C:
+			log.Trace("Kafka buffer: Message received")
 			k.Process(m)
+			log.Trace("Message processed")
 		}
 	}
+	ticker.Stop()
+	k.Send()
 }
 
 // Process adds a message to the buffer
@@ -77,6 +90,7 @@ func (k *Buffer) Process(msg Message) {
 	}
 	k.buffer = append(k.buffer, m)
 	if len(k.buffer) > k.batchSize {
+		log.Debugf("Triggering flush (buffer is %d, batchSize is %d)", len(k.buffer), k.batchSize)
 		k.Send()
 		return
 	}
@@ -84,29 +98,30 @@ func (k *Buffer) Process(msg Message) {
 
 // Send will send all messages in the buffer to the kafka broker
 func (k *Buffer) Send() {
-	// send might have been called prematurely. Detect it and return if that is the case.
-	if time.Since(k.lastSend) < k.interval || len(k.buffer) < k.batchSize {
+	if len(k.buffer) == 0 {
+		log.Trace("buffer empty")
 		return
 	}
-	// bail out if we're in a failure state and it isn't time to retry yet.
 	if k.failureState && time.Since(k.lastHealthCheck) < k.failureRetryInterval {
+		log.Tracef("In a failed state. Time since last check: %v (%v)", time.Since(k.lastHealthCheck), k.failureRetryInterval)
 		return
 	}
 	var err error
+	start := time.Now()
 	if len(k.buffer) < k.maxBatchSize {
 		err = k.sendAll()
 	} else {
 		err = k.sendBatched()
 	}
 	if err != nil {
+		log.Errorf("kafkabuffer/Send: %s (time taken: %v)", err, time.Since(start))
 		k.failureState = true
 		return
 	}
-	if err == nil {
-		k.failureState = false
-		k.buffer = k.buffer[:0] // clear the buffer
-		k.lastSend = time.Now()
-	}
+	log.Debugf("kafkabuffer/Send: Wrote %d messages in %v", len(k.buffer), time.Since(start))
+	k.failureState = false
+	k.buffer = k.buffer[:0] // clear the buffer
+	k.lastSend = time.Now()
 }
 
 // sendAll sends all messages in the buffer.
