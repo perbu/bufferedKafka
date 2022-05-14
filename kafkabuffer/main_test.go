@@ -18,23 +18,25 @@ type mockWriter struct {
 	messageDelay time.Duration
 	storage      []kafka.Message
 	failed       bool
-	counter      uint64
+	msgs         uint64
+	writes       uint64
 }
 
 func (m *mockWriter) WriteMessages(_ context.Context, msgs ...kafka.Message) error {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	time.Sleep(m.messageDelay)
 	if m.failed {
 		return errors.New("storage is in a failed state")
 	}
-	defer m.mu.Unlock()
 	if m.storage == nil {
 		m.storage = make([]kafka.Message, 0)
 	}
 	l := uint64(len(msgs))
 	log.Debugf("Writing %d messages to pretend kafka", l)
 	m.storage = append(m.storage, msgs...)
-	atomic.AddUint64(&m.counter, l)
+	atomic.AddUint64(&m.msgs, l)
+	atomic.AddUint64(&m.writes, 1)
 	return nil
 }
 
@@ -57,6 +59,17 @@ func (m *mockWriter) getMessage(id int) kafka.Message {
 	return m.storage[id]
 }
 
+func waitForAtomic(a *uint64, v uint64, timeout, sleeptime time.Duration) error {
+	start := time.Now()
+	for time.Since(start) < timeout {
+		if atomic.LoadUint64(a) == v {
+			return nil
+		}
+		time.Sleep(sleeptime)
+	}
+	return errors.New("kafkaTimeout")
+}
+
 func TestMain(m *testing.M) {
 	log.SetLevel(log.TraceLevel)
 	log.Debug("Running test suite")
@@ -67,12 +80,16 @@ func TestMain(m *testing.M) {
 
 func TestBuffer_Run(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	buffer := makeTestBuffer(nil)
+	storage := &mockWriter{}
+	buffer := makeTestBuffer(storage)
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		buffer.Run(ctx)
+		err := buffer.Run(ctx)
+		if err != nil {
+			log.Errorf("Error %s", err)
+		}
 		log.Info("Buffer run complete")
 	}()
 	time.Sleep(100 * time.Millisecond)
@@ -92,6 +109,7 @@ func makeTestBuffer(writer *mockWriter) Buffer {
 		C:                    make(chan Message, 0),
 		batchSize:            5,
 		maxBatchSize:         20,
+		kafkaTimeout:         25 * time.Millisecond,
 	}
 }
 
@@ -103,7 +121,10 @@ func TestBuffer_Process_ok(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		buffer.Run(ctx)
+		err := buffer.Run(ctx)
+		if err != nil {
+			log.Errorf("Error %s", err)
+		}
 		log.Info("Buffer run complete")
 	}()
 
@@ -127,7 +148,10 @@ func TestBuffer_Process_fail(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		buffer.Run(ctx)
+		err := buffer.Run(ctx)
+		if err != nil {
+			log.Errorf("Error %s", err)
+		}
 		log.Info("Buffer run complete")
 	}()
 	log.Info("Sending msgs 0 -> 5 ")
@@ -142,7 +166,7 @@ func TestBuffer_Process_fail(t *testing.T) {
 	log.Info("Done with msgs")
 	time.Sleep(100 * time.Millisecond)
 	storage.setState(false)
-	time.Sleep(100 * time.Second)
+	time.Sleep(1 * time.Second)
 	cancel()
 	wg.Wait()
 	for i := 0; i < 10; i++ {
@@ -161,7 +185,10 @@ func TestBuffer_Process_initial_fail(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		buffer.Run(ctx)
+		err := buffer.Run(ctx)
+		if err != nil {
+			log.Errorf("Error %s", err)
+		}
 		log.Info("Buffer run complete")
 	}()
 	for i := 0; i < 5; i++ {
@@ -176,6 +203,68 @@ func TestBuffer_Process_initial_fail(t *testing.T) {
 		fmt.Printf("Message: %s\n", string(m.Value))
 	}
 	log.Debug("Done")
+}
+
+func TestBuffer_Process_slow(t *testing.T) {
+	storage := &mockWriter{}
+	storage.setState(true)
+	storage.setDelay(10 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	buffer := makeTestBuffer(storage)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := buffer.Run(ctx)
+		if err != nil {
+			log.Errorf("Error %s", err)
+		}
+		log.Info("Buffer run complete")
+	}()
+	for i := 0; i < 5; i++ {
+		buffer.C <- makeMessage("test", i)
+	}
+	storage.setState(false)
+	time.Sleep(1 * time.Second)
+	cancel()
+	wg.Wait()
+	for i := 0; i < 5; i++ {
+		m := storage.getMessage(i)
+		fmt.Printf("Message: %s\n", string(m.Value))
+	}
+	log.Debug("Done")
+}
+
+func TestBuffer_Batching(t *testing.T) {
+	storage := &mockWriter{}
+	buffer := makeTestBuffer(storage)
+	buffer.batchSize = 100
+	buffer.maxBatchSize = 1000
+	ctx, cancel := context.WithCancel(context.Background())
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := buffer.Run(ctx)
+		if err != nil {
+			log.Errorf("Error %s", err)
+		}
+		log.Info("Buffer run complete")
+	}()
+	storage.setState(true)
+	for i := 0; i < 10000; i++ {
+		buffer.C <- makeMessage("test", i)
+	}
+	storage.setState(false)
+	time.Sleep(1 * time.Second)
+	cancel()
+	wg.Wait()
+	for i := 0; i < 5; i++ {
+		m := storage.getMessage(i)
+		fmt.Printf("Message: %s\n", string(m.Value))
+	}
+	log.Debug("Done")
+
 }
 
 func makeMessage(topic string, id int) Message {

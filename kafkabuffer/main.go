@@ -3,6 +3,7 @@ package kafkabuffer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/segmentio/kafka-go"
 	log "github.com/sirupsen/logrus"
 	"time"
@@ -29,6 +30,7 @@ type Buffer struct {
 	writer               kwriter
 	maxBatchSize         int
 	topic                string
+	kafkaTimeout         time.Duration
 }
 
 type Message struct {
@@ -51,7 +53,11 @@ func Initialize(broker string, flush int, interval time.Duration) *Buffer {
 }
 
 // Run starts monitoring the channel and sends messages to the broker.
-func (k *Buffer) Run(ctx context.Context) {
+func (k *Buffer) Run(ctx context.Context) error {
+	err := k.sendTestMessage()
+	if err != nil {
+		return fmt.Errorf("failed to send initial test message: %w", err)
+	}
 	ticker := time.NewTicker(k.interval)
 	log.Debugf("Kafka buffer started with interval %v", k.interval)
 loop:
@@ -64,22 +70,21 @@ loop:
 			if time.Since(k.lastSend) < k.interval {
 				log.Trace("Tick: Send it!")
 				k.Send()
-			} else {
-				log.Trace("Tick: Not sending anything")
 			}
 		case m := <-k.C:
 			log.Trace("Kafka buffer: Message received")
-			k.Process(m)
-			log.Trace("Message processed")
+			k.Enqueue(m)
 		}
 	}
 	ticker.Stop()
 	k.Send()
+	return nil
 }
 
-// Process adds a message to the buffer
+// Enqueue adds a message to the buffer
 // It'll transform it from the Message type (used by MQTT) to what Kafka expects.
-func (k *Buffer) Process(msg Message) {
+// if the number of enqueued messages is greater than the batch size, it'll send them.
+func (k *Buffer) Enqueue(msg Message) {
 	msgJson, err := json.Marshal(msg)
 	if err != nil {
 		// todo: Log the error. There is nothing else we can do here.
@@ -103,7 +108,8 @@ func (k *Buffer) Send() {
 		return
 	}
 	if k.failureState && time.Since(k.lastHealthCheck) < k.failureRetryInterval {
-		log.Tracef("In a failed state. Time since last check: %v (%v)", time.Since(k.lastHealthCheck), k.failureRetryInterval)
+		log.Tracef("In a failed state. Not time to retry yet. Time since last check: %v (%v)",
+			time.Since(k.lastHealthCheck), k.failureRetryInterval)
 		return
 	}
 	var err error
@@ -126,18 +132,24 @@ func (k *Buffer) Send() {
 
 // sendAll sends all messages in the buffer.
 func (k *Buffer) sendAll() error {
-	return k.writer.WriteMessages(context.Background(), k.buffer...)
+	ctx, cancel := context.WithTimeout(context.Background(), k.kafkaTimeout)
+	defer cancel()
+	return k.writer.WriteMessages(ctx, k.buffer...)
 }
 
 // sendBatched sends messages in batches of maxBatchSize.
 func (k *Buffer) sendBatched() error {
 	l := len(k.buffer)
+	batches := l / k.maxBatchSize
+	timeout := k.kafkaTimeout * time.Duration(batches)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 	for i := 0; i < l; i += k.maxBatchSize {
 		end := i + k.maxBatchSize
 		if end > l {
 			end = l
 		}
-		err := k.writer.WriteMessages(context.Background(), k.buffer[i:end]...)
+		err := k.writer.WriteMessages(ctx, k.buffer[i:end]...)
 		if err != nil {
 			return err
 		}
