@@ -3,6 +3,7 @@ module github.com/perbu/bufferedKafka
 go 1.18
 
 require (
+	github.com/matryer/is v1.4.0
 	github.com/segmentio/kafka-go v0.4.31
 	github.com/sirupsen/logrus v1.8.1
 )
